@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
@@ -219,12 +221,41 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 	a.bus.Signal(signal)
 	defer a.bus.RemoveSignal(signal)
 
-	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
-	a.bus.AddMatchSignal(propertiesChangedMatchOptions...)
-	defer a.bus.RemoveMatchSignal(propertiesChangedMatchOptions...)
+	// Narrow the match rules to BlueZ-only traffic. A bare Properties match is
+	// system-wide: every property change from every service on the system bus
+	// (NetworkManager, UPower, ...) would be decoded and fanned out to every
+	// registered signal channel, forever.
+	deviceMatchOptions := []dbus.MatchOption{
+		dbus.WithMatchSender("org.bluez"),
+		dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
+		dbus.WithMatchMember("PropertiesChanged"),
+		dbus.WithMatchArg(0, "org.bluez.Device1"),
+	}
+	if err := a.bus.AddMatchSignal(deviceMatchOptions...); err != nil {
+		return err
+	}
+	defer a.bus.RemoveMatchSignal(deviceMatchOptions...)
 
-	newObjectMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.ObjectManager")}
-	a.bus.AddMatchSignal(newObjectMatchOptions...)
+	adapterMatchOptions := []dbus.MatchOption{
+		dbus.WithMatchSender("org.bluez"),
+		dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
+		dbus.WithMatchMember("PropertiesChanged"),
+		dbus.WithMatchArg(0, "org.bluez.Adapter1"),
+	}
+	if err := a.bus.AddMatchSignal(adapterMatchOptions...); err != nil {
+		return err
+	}
+	defer a.bus.RemoveMatchSignal(adapterMatchOptions...)
+
+	// InterfacesAdded (new devices) and InterfacesRemoved (devices BlueZ
+	// expired — used to evict our cache below).
+	newObjectMatchOptions := []dbus.MatchOption{
+		dbus.WithMatchSender("org.bluez"),
+		dbus.WithMatchInterface("org.freedesktop.DBus.ObjectManager"),
+	}
+	if err := a.bus.AddMatchSignal(newObjectMatchOptions...); err != nil {
+		return err
+	}
 	defer a.bus.RemoveMatchSignal(newObjectMatchOptions...)
 
 	// Check if the adapter is powered on.
@@ -243,7 +274,9 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 	a.scanCancelChan = cancelChan
 
 	// This appears to be necessary to receive any BLE discovery results at all.
-	defer a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0)
+	// The reset call must pass an empty dict: BlueZ's SetDiscoveryFilter has
+	// signature a{sv} and rejects a call with no arguments.
+	defer a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0, map[string]interface{}{})
 	err = a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0, map[string]interface{}{
 		"Transport": "le",
 	}).Err
@@ -317,10 +350,22 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 				}
 				devices[objectPath] = rawprops
 				callback(a, makeScanResult(rawprops))
+			case "org.freedesktop.DBus.ObjectManager.InterfacesRemoved":
+				// BlueZ expired a (temporary) device: evict our cached copy so
+				// the map tracks BlueZ's own bounded cache instead of growing
+				// for as long as the scan runs.
+				if objectPath, ok := sig.Body[0].(dbus.ObjectPath); ok {
+					delete(devices, objectPath)
+				}
 			case "org.freedesktop.DBus.Properties.PropertiesChanged":
 				interfaceName := sig.Body[0].(string)
 				switch interfaceName {
 				case "org.bluez.Adapter1":
+					if sig.Path != a.adapter.Path() {
+						// Another adapter on this system powered off or stopped
+						// discovering; not ours, ignore.
+						continue
+					}
 					// check power state
 					changes := sig.Body[1].(map[string]dbus.Variant)
 					if powered, ok := changes["Powered"]; ok && !powered.Value().(bool) {
@@ -458,8 +503,15 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	a.bus.Signal(signal)
 	defer close(signal)
 	defer a.bus.RemoveSignal(signal)
-	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
-	a.bus.AddMatchSignal(propertiesChangedMatchOptions...)
+	// Narrowed to BlueZ property changes only — see the note in Scan.
+	propertiesChangedMatchOptions := []dbus.MatchOption{
+		dbus.WithMatchSender("org.bluez"),
+		dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
+		dbus.WithMatchMember("PropertiesChanged"),
+	}
+	if err := a.bus.AddMatchSignal(propertiesChangedMatchOptions...); err != nil {
+		return Device{}, err
+	}
 	defer a.bus.RemoveMatchSignal(propertiesChangedMatchOptions...)
 
 	powered, err := a.adapter.GetProperty("org.bluez.Adapter1.Powered")
@@ -484,8 +536,18 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 			return Device{}, fmt.Errorf("bluetooth: failed to connect: %w", err)
 		}
 
-		// Wait until the device has connected.
+		// Wait until the device has connected. connectChan is closed at most
+		// once (a Powered=false and a Connected=true event can both arrive
+		// before the watcher goroutine winds down).
 		connectChan := make(chan struct{})
+		var connectErr error
+		var closeOnce sync.Once
+		finish := func(result error) {
+			closeOnce.Do(func() {
+				connectErr = result
+				close(connectChan)
+			})
+		}
 		go func() {
 			for sig := range signal {
 				switch sig.Name {
@@ -493,13 +555,14 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 					interfaceName := sig.Body[0].(string)
 					switch interfaceName {
 					case "org.bluez.Adapter1":
+						if sig.Path != a.adapter.Path() {
+							continue // a different adapter on this system
+						}
 						// check power state
 						changes := sig.Body[1].(map[string]dbus.Variant)
 						for k, v := range changes {
 							if k == "Powered" && !v.Value().(bool) {
-								// adapter is powered off, stop the scan
-								err = errAdaptorNotPowered
-								close(connectChan)
+								finish(errAdaptorNotPowered)
 							}
 						}
 					case "org.bluez.Device1":
@@ -508,16 +571,28 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 						}
 						changes := sig.Body[1].(map[string]dbus.Variant)
 						if connected, ok := changes["Connected"].Value().(bool); ok && connected {
-							close(connectChan)
+							finish(nil)
 						}
 					}
 				}
 			}
 		}()
-		<-connectChan
 
-		if err != nil {
-			return Device{}, err
+		// Honor the connection timeout: without one, a Connect to a device
+		// that has gone away parks this goroutine forever (BlueZ's own
+		// attempt can outlive the caller's patience, or bluetoothd can wedge).
+		timeout := 30 * time.Second
+		if params.ConnectionTimeout != 0 {
+			timeout = time.Duration(params.ConnectionTimeout) * 625 * time.Microsecond
+		}
+		select {
+		case <-connectChan:
+		case <-time.After(timeout):
+			return Device{}, errors.New("bluetooth: timeout on Connect")
+		}
+
+		if connectErr != nil {
+			return Device{}, connectErr
 		}
 	}
 
@@ -534,6 +609,11 @@ func (d Device) Disconnect() error {
 	if d.adapter.connectHandler != nil {
 		d.adapter.connectHandler(d, false)
 	}
+
+	// Drop this device's notification callbacks so a later reconnect cannot
+	// double-deliver notifications through stale subscriptions (BlueZ object
+	// paths are deterministic, so old path keys match again after reconnect).
+	d.adapter.removeDeviceSubscriptions(d.device.Path())
 
 	// we don't call our cancel function here, instead we wait for the
 	// property change in `watchForConnect` and cancel things then

@@ -8,6 +8,7 @@ package bluetooth
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -24,6 +25,14 @@ type Adapter struct {
 	adapter              dbus.BusObject // object at /org/bluez/hciX
 	address              string
 	defaultAdvertisement *Advertisement
+
+	// Notification dispatch: ONE signal channel + goroutine serves every
+	// subscribed characteristic (see gattc_linux.go). godbus delivers every
+	// received signal to every registered channel, so per-characteristic
+	// channels would multiply all D-Bus traffic by the subscription count.
+	notifMu   sync.Mutex
+	notifSubs map[dbus.ObjectPath]func([]byte) // characteristic path -> callback
+	notifCh   chan *dbus.Signal                // nil until the dispatcher starts
 
 	connectHandler func(device Device, connected bool)
 }
@@ -74,6 +83,10 @@ func (a *Adapter) Reset() error {
 	a.adapter = nil
 	a.address = ""
 	a.scanCancelChan = nil
+	a.notifMu.Lock()
+	a.notifSubs = nil
+	a.notifCh = nil // a new dispatcher starts on the next EnableNotifications
+	a.notifMu.Unlock()
 	return nil
 }
 

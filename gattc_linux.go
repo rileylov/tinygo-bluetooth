@@ -135,10 +135,8 @@ func (d Device) DiscoverServices(uuids []UUID) ([]DeviceService, error) {
 // device.
 type DeviceCharacteristic struct {
 	uuidWrapper
-	adapter                      *Adapter
-	characteristic               dbus.BusObject
-	property                     chan *dbus.Signal // channel where notifications are reported
-	propertiesChangedMatchOption dbus.MatchOption  // the same value must be passed to RemoveMatchSignal
+	adapter        *Adapter
+	characteristic dbus.BusObject
 }
 
 // UUID returns the UUID for this DeviceCharacteristic.
@@ -250,62 +248,134 @@ func (c DeviceCharacteristic) Write(p []byte) (int, error) {
 // changes.
 //
 // Users may call EnableNotifications with a nil callback to disable notifications.
+//
+// All subscriptions on the adapter share one dispatcher goroutine and one
+// (narrow) D-Bus match rule; godbus fans every received signal out to every
+// registered channel, so per-subscription channels would multiply all D-Bus
+// traffic by the subscription count — and leak channel + goroutine + match
+// rule whenever a device disconnected without an explicit unsubscribe.
 func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) error {
-	switch callback {
-	default:
-		if c.property != nil {
-			return errDupNotif
-		}
+	path := c.characteristic.Path()
 
-		// Start watching for changes in the Value property.
-		c.property = make(chan *dbus.Signal)
-		c.adapter.bus.Signal(c.property)
-		c.propertiesChangedMatchOption = dbus.WithMatchInterface("org.freedesktop.DBus.Properties")
-		c.adapter.bus.AddMatchSignal(c.propertiesChangedMatchOption)
-
-		err := c.characteristic.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err
-		if err != nil {
-			return err
-		}
-
-		go func() {
-			for sig := range c.property {
-				if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
-					interfaceName := sig.Body[0].(string)
-					if interfaceName != "org.bluez.GattCharacteristic1" {
-						continue
-					}
-					if sig.Path != c.characteristic.Path() {
-						continue
-					}
-					changes := sig.Body[1].(map[string]dbus.Variant)
-					if value, ok := changes["Value"].Value().([]byte); ok {
-						callback(value)
-					}
-				}
-			}
-		}()
-
-		return nil
-
-	case nil:
-		if c.property == nil {
+	if callback == nil {
+		c.adapter.notifMu.Lock()
+		_, active := c.adapter.notifSubs[path]
+		delete(c.adapter.notifSubs, path)
+		c.adapter.notifMu.Unlock()
+		if !active {
 			return nil
 		}
-		// Make the D-Bus call to stop notifications on the characteristic.
-		stopNotifyErr := c.characteristic.Call("org.bluez.GattCharacteristic1.StopNotify", 0).Err
-		// Still clean up other resources if there was an error
-		removeSignalErr := c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
-		c.adapter.bus.RemoveSignal(c.property)
-		close(c.property)
-		c.property = nil
-
-		// If there were errors, prioritize notify err
-		if stopNotifyErr == nil {
-			return removeSignalErr
-		}
-		return stopNotifyErr		
+		return c.characteristic.Call("org.bluez.GattCharacteristic1.StopNotify", 0).Err
 	}
+
+	if err := c.adapter.startNotificationDispatcher(); err != nil {
+		return err
+	}
+
+	// Register first (atomically with the duplicate check), then StartNotify;
+	// deregister again if BlueZ refuses. Registering a channel that never gets
+	// a running consumer — the old failure mode — must not be possible.
+	c.adapter.notifMu.Lock()
+	if _, dup := c.adapter.notifSubs[path]; dup {
+		c.adapter.notifMu.Unlock()
+		return errDupNotif
+	}
+	c.adapter.notifSubs[path] = callback
+	c.adapter.notifMu.Unlock()
+
+	if err := c.characteristic.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err; err != nil {
+		c.adapter.notifMu.Lock()
+		delete(c.adapter.notifSubs, path)
+		c.adapter.notifMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// startNotificationDispatcher lazily starts the adapter's shared notification
+// dispatcher: one buffered signal channel, one goroutine, and two match rules
+// narrowed to BlueZ traffic (characteristic value updates, plus device
+// Connected changes so subscriptions are torn down when a peripheral drops).
+// It runs for the rest of the adapter's lifetime, which costs one goroutine.
+func (a *Adapter) startNotificationDispatcher() error {
+	a.notifMu.Lock()
+	defer a.notifMu.Unlock()
+	if a.notifCh != nil {
+		return nil
+	}
+
+	charOpts := []dbus.MatchOption{
+		dbus.WithMatchSender("org.bluez"),
+		dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
+		dbus.WithMatchMember("PropertiesChanged"),
+		dbus.WithMatchArg(0, "org.bluez.GattCharacteristic1"),
+	}
+	if err := a.bus.AddMatchSignal(charOpts...); err != nil {
+		return err
+	}
+	devOpts := []dbus.MatchOption{
+		dbus.WithMatchSender("org.bluez"),
+		dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
+		dbus.WithMatchMember("PropertiesChanged"),
+		dbus.WithMatchArg(0, "org.bluez.Device1"),
+	}
+	if err := a.bus.AddMatchSignal(devOpts...); err != nil {
+		a.bus.RemoveMatchSignal(charOpts...)
+		return err
+	}
+
+	ch := make(chan *dbus.Signal, 128)
+	a.bus.Signal(ch)
+	a.notifCh = ch
+	if a.notifSubs == nil {
+		a.notifSubs = make(map[dbus.ObjectPath]func([]byte))
+	}
+	go a.runNotificationDispatcher(ch)
+	return nil
+}
+
+func (a *Adapter) runNotificationDispatcher(ch chan *dbus.Signal) {
+	for sig := range ch {
+		if sig.Name != "org.freedesktop.DBus.Properties.PropertiesChanged" {
+			continue
+		}
+		interfaceName, _ := sig.Body[0].(string)
+		changes, ok := sig.Body[1].(map[string]dbus.Variant)
+		if !ok {
+			continue
+		}
+		switch interfaceName {
+		case "org.bluez.GattCharacteristic1":
+			if value, ok := changes["Value"].Value().([]byte); ok {
+				a.notifMu.Lock()
+				callback := a.notifSubs[sig.Path]
+				a.notifMu.Unlock()
+				if callback != nil {
+					callback(value)
+				}
+			}
+		case "org.bluez.Device1":
+			// A peripheral disconnected: drop its subscriptions so nothing is
+			// leaked and a reconnect can't double-deliver through stale
+			// callbacks (BlueZ object paths are deterministic per device).
+			if connected, ok := changes["Connected"].Value().(bool); ok && !connected {
+				a.removeDeviceSubscriptions(sig.Path)
+			}
+		}
+	}
+}
+
+// removeDeviceSubscriptions drops the notification callbacks of every
+// characteristic that belongs to the device at the given object path.
+func (a *Adapter) removeDeviceSubscriptions(devicePath dbus.ObjectPath) {
+	prefix := string(devicePath) + "/"
+	a.notifMu.Lock()
+	for path := range a.notifSubs {
+		if strings.HasPrefix(string(path), prefix) {
+			delete(a.notifSubs, path)
+		}
+	}
+	a.notifMu.Unlock()
 }
 
 // GetMTU returns the MTU for the characteristic.
