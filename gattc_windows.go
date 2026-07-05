@@ -123,10 +123,12 @@ func (d Device) DiscoverServices(filterUUIDs []UUID) ([]DeviceService, error) {
 			services = append(services, makeService(serviceUuid, srv, d))
 		}
 
-		go func() {
-			<-d.ctx.Done()
-			srv.Close()
-		}()
+		// Track every service (matched or filtered out) so Disconnect closes
+		// and releases it. This replaces the previous goroutine-per-service
+		// waiting on ctx.Done(), which closed but never released the object.
+		if d.resources != nil {
+			d.resources.addService(srv)
+		}
 	}
 
 	if slices.Contains(services, (DeviceService{})) {
@@ -243,6 +245,11 @@ func (s DeviceService) DiscoverCharacteristics(filterUUIDs []UUID) ([]DeviceChar
 		}
 
 		characteristic := (*genericattributeprofile.GattCharacteristic)(c)
+		// Track every characteristic (matched or filtered out) so Disconnect
+		// releases it; previously these objects were never released at all.
+		if res := s.device.resources; res != nil {
+			res.addChar(characteristic)
+		}
 		guid, err := characteristic.GetUuid()
 		if err != nil {
 			return nil, err
@@ -537,10 +544,18 @@ func (c DeviceCharacteristic) EnableNotificationsWithMode(mode NotificationMode,
 		})
 		token, err := c.characteristic.AddValueChanged(valueChangedEventHandler)
 		if err != nil {
+			valueChangedEventHandler.Release()
 			return err
 		}
 		c.valueChangedEventHandlerToken = token
 		c.valueChangedEventHandler = valueChangedEventHandler
+		// Track the subscription so Disconnect removes the handler even when
+		// the app never explicitly disables notifications. A leaked handler
+		// can never reach refcount zero: it pins native heap allocations plus
+		// a keepalive goroutine with a running timer inside winrt-go.
+		if res := c.service.device.resources; res != nil {
+			res.addNotifChar(c.deviceCharacteristic)
+		}
 	}
 
 	writeOp, err := c.characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(configValue)

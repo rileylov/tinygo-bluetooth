@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -343,6 +344,77 @@ type Device struct {
 	session                       *genericattributeprofile.GattSession
 	connectionStatusListenerToken foundation.EventRegistrationToken
 	connectionStatusListener      *foundation.TypedEventHandler
+
+	// resources tracks the per-connection WinRT objects (services,
+	// characteristics, notification handlers) so Disconnect can release them.
+	// Without this, every discovery and every notification subscription leaks
+	// native objects — and each leaked notification handler additionally pins
+	// a keepalive goroutine with a running timer inside winrt-go.
+	resources *deviceResources
+
+	// closeOnce makes Disconnect idempotent: both the application and the
+	// ConnectionStatusChanged handler call it (the handler on remote drops),
+	// and releasing the COM references twice corrupts their refcounts.
+	closeOnce *sync.Once
+}
+
+// deviceResources collects the WinRT objects that belong to one connection.
+type deviceResources struct {
+	mu         sync.Mutex
+	services   []*genericattributeprofile.GattDeviceService
+	chars      []*genericattributeprofile.GattCharacteristic
+	notifChars []*deviceCharacteristic // wrappers holding an active ValueChanged handler
+}
+
+func (r *deviceResources) addService(s *genericattributeprofile.GattDeviceService) {
+	r.mu.Lock()
+	r.services = append(r.services, s)
+	r.mu.Unlock()
+}
+
+func (r *deviceResources) addChar(c *genericattributeprofile.GattCharacteristic) {
+	r.mu.Lock()
+	r.chars = append(r.chars, c)
+	r.mu.Unlock()
+}
+
+func (r *deviceResources) addNotifChar(dc *deviceCharacteristic) {
+	r.mu.Lock()
+	for _, existing := range r.notifChars {
+		if existing == dc {
+			r.mu.Unlock()
+			return
+		}
+	}
+	r.notifChars = append(r.notifChars, dc)
+	r.mu.Unlock()
+}
+
+// releaseAll removes still-registered notification handlers and releases every
+// tracked service and characteristic. Called once, from Disconnect.
+func (r *deviceResources) releaseAll() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, dc := range r.notifChars {
+		if dc.valueChangedEventHandler != nil {
+			_ = dc.characteristic.RemoveValueChanged(dc.valueChangedEventHandlerToken)
+			dc.valueChangedEventHandler.Release()
+			dc.valueChangedEventHandler = nil
+		}
+	}
+	r.notifChars = nil
+	for _, c := range r.chars {
+		c.Release()
+	}
+	r.chars = nil
+	for _, s := range r.services {
+		_ = s.Close()
+		s.Release()
+	}
+	r.services = nil
 }
 
 // Connect starts a connection attempt to the given peripheral device address.
@@ -420,6 +492,9 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 
 		device:  bleDevice,
 		session: newSession,
+
+		resources: &deviceResources{},
+		closeOnce: &sync.Once{},
 	}
 
 	// https://learn.microsoft.com/es-es/uwp/api/windows.devices.bluetooth.bluetoothledevice.connectionstatuschanged?view=winrt-26100
@@ -459,7 +534,20 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 
 // Disconnect from the BLE device. This method is non-blocking and does not
 // wait until the connection is fully gone.
+//
+// Disconnect is idempotent: it is called both by applications and by the
+// ConnectionStatusChanged handler when the peripheral drops the connection,
+// and the teardown must run exactly once.
 func (d Device) Disconnect() error {
+	var err error
+	if d.closeOnce != nil {
+		d.closeOnce.Do(func() { err = d.disconnect() })
+		return err
+	}
+	return d.disconnect()
+}
+
+func (d Device) disconnect() error {
 	defer d.device.Release()
 	defer d.session.Release()
 	if d.connectionStatusListener != nil {
@@ -467,6 +555,10 @@ func (d Device) Disconnect() error {
 	}
 
 	d.cancel()
+
+	// Remove any still-active notification handlers and release the service
+	// and characteristic objects discovered on this connection.
+	d.resources.releaseAll()
 
 	if err := d.session.Close(); err != nil {
 		return err
