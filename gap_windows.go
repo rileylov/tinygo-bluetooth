@@ -140,7 +140,10 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) (err error) {
 		return
 	}
 	defer func() {
-		_ = a.watcher.Release()
+		// Same grace period as the event handlers below: a Received event can
+		// still be running on a WinRT thread as the scan winds down.
+		w := a.watcher
+		time.AfterFunc(2*time.Second, func() { _ = w.Release() })
 		a.watcher = nil
 	}()
 
@@ -201,7 +204,11 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) (err error) {
 		}
 		callback(a, result)
 	})
-	defer handler.Release()
+	// Grace period before releasing: WinRT can still be dispatching a
+	// Received event on another thread when this scan returns (advertisement
+	// traffic is continuous), and freeing the delegate under a running
+	// callback crashes the process. Removal below stops new dispatches.
+	defer time.AfterFunc(2*time.Second, func() { handler.Release() })
 
 	token, err := a.watcher.AddReceived(handler)
 	if err != nil {
@@ -233,7 +240,7 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) (err error) {
 		}
 		close(stoppingChan)
 	})
-	defer stoppedHandler.Release()
+	defer time.AfterFunc(2*time.Second, func() { stoppedHandler.Release() })
 
 	token, err = a.watcher.AddStopped(stoppedHandler)
 	if err != nil {
