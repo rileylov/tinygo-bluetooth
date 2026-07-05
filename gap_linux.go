@@ -5,6 +5,7 @@ package bluetooth
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -319,6 +320,19 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 	// powered off, or was recently powered off.
 	startDiscovery := a.adapter.Go("org.bluez.Adapter1.StartDiscovery", 0, nil)
 
+	// Watchdog against a silently wedged discovery: after connect/disconnect
+	// cycles, bluetoothd can keep reporting Discovering=true while the
+	// controller has stopped actually scanning — no error, no signals, ever.
+	// (Any other client starting a scan un-wedges it, which is how this hides
+	// so well.) If nothing at all arrives for a while — real environments
+	// always have ambient BLE traffic — cycle discovery to re-arm the radio.
+	// A kick when things were healthy is harmless.
+	const scanSilenceRestart = 12 * time.Second
+	watchdog := time.NewTicker(3 * time.Second)
+	defer watchdog.Stop()
+	lastSignal := time.Now()
+	var lastKick time.Time
+
 	for {
 		// Check whether the scan is stopped. This is necessary to avoid a race
 		// condition between the signal channel and the cancelScan channel when
@@ -331,6 +345,17 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 		}
 
 		select {
+		case <-watchdog.C:
+			if time.Since(lastSignal) < scanSilenceRestart {
+				continue
+			}
+			log.Printf("bluetooth: no scan traffic for %s — restarting discovery", scanSilenceRestart)
+			lastKick = time.Now()
+			lastSignal = time.Now() // don't kick again immediately
+			_ = a.adapter.Call("org.bluez.Adapter1.StopDiscovery", 0).Err
+			if err := a.adapter.Call("org.bluez.Adapter1.StartDiscovery", 0).Err; err != nil {
+				log.Printf("bluetooth: discovery restart failed: %v", err)
+			}
 		case <-startDiscovery.Done:
 			if startDiscovery.Err != nil {
 				close(cancelChan)
@@ -338,6 +363,7 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 				return startDiscovery.Err
 			}
 		case sig := <-signal:
+			lastSignal = time.Now()
 			// This channel receives anything that we watch for, so we'll have
 			// to check for signals that are relevant to us.
 			switch sig.Name {
@@ -374,6 +400,11 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 						a.scanCancelChan = nil
 						return errAdaptorNotPowered
 					} else if discovering, ok := changes["Discovering"]; ok && !discovering.Value().(bool) {
+						if time.Since(lastKick) < 3*time.Second {
+							// Our own watchdog restart: the StopDiscovery half
+							// of the kick, not an external stop.
+							continue
+						}
 						// adapter stopped discovering unexpectedly (e.g. due to external event)
 						close(cancelChan)
 						a.scanCancelChan = nil
