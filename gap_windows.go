@@ -135,21 +135,29 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) (err error) {
 		return errScanning
 	}
 
-	a.watcher, err = advertisement.NewBluetoothLEAdvertisementWatcher()
+	// The watcher is held in a local for the whole scan: a.watcher is shared
+	// state that a rapidly restarted scan reassigns, so reading it back later
+	// (especially in cleanup) races the next scan — the classic outcome was
+	// this scan's cleanup clearing or releasing the NEXT scan's watcher.
+	watcher, err := advertisement.NewBluetoothLEAdvertisementWatcher()
 	if err != nil {
 		return
 	}
+	a.watcher = watcher
 	defer func() {
 		// Same grace period as the event handlers below: a Received event can
 		// still be running on a WinRT thread as the scan winds down.
-		w := a.watcher
-		time.AfterFunc(2*time.Second, func() { _ = w.Release() })
-		a.watcher = nil
+		time.AfterFunc(2*time.Second, func() { _ = watcher.Release() })
+		// Only clear the shared field if it still refers to this scan's
+		// watcher — a newer scan may have already replaced it.
+		if a.watcher == watcher {
+			a.watcher = nil
+		}
 	}()
 
 	// Set scanning mode to active so we receive scan responses
 	// from devices in advertising mode
-	err = a.watcher.SetScanningMode(advertisement.BluetoothLEScanningModeActive)
+	err = watcher.SetScanningMode(advertisement.BluetoothLEScanningModeActive)
 	if err != nil {
 		return
 	}
@@ -210,11 +218,11 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) (err error) {
 	// callback crashes the process. Removal below stops new dispatches.
 	defer time.AfterFunc(2*time.Second, func() { handler.Release() })
 
-	token, err := a.watcher.AddReceived(handler)
+	token, err := watcher.AddReceived(handler)
 	if err != nil {
 		return
 	}
-	defer a.watcher.RemoveReceived(token)
+	defer watcher.RemoveReceived(token)
 
 	// Wait for when advertisement has stopped by a call to StopScan().
 	// Advertisement doesn't seem to stop right away, there is an
@@ -242,13 +250,13 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) (err error) {
 	})
 	defer time.AfterFunc(2*time.Second, func() { stoppedHandler.Release() })
 
-	token, err = a.watcher.AddStopped(stoppedHandler)
+	token, err = watcher.AddStopped(stoppedHandler)
 	if err != nil {
 		return
 	}
-	defer a.watcher.RemoveStopped(token)
+	defer watcher.RemoveStopped(token)
 
-	err = a.watcher.Start()
+	err = watcher.Start()
 	if err != nil {
 		return err
 	}
