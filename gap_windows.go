@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/go-ole/go-ole"
@@ -392,6 +394,11 @@ type Device struct {
 	// ConnectionStatusChanged handler call it (the handler on remote drops),
 	// and releasing the COM references twice corrupts their refcounts.
 	closeOnce *sync.Once
+
+	// closed tells the ConnectionStatusChanged handler that teardown has
+	// begun, so a status event racing Disconnect doesn't touch objects that
+	// are about to be (or already are) released.
+	closed *atomic.Bool
 }
 
 // deviceResources collects the WinRT objects that belong to one connection.
@@ -439,8 +446,13 @@ func (r *deviceResources) releaseAll() {
 	for _, dc := range r.notifChars {
 		if dc.valueChangedEventHandler != nil {
 			_ = dc.characteristic.RemoveValueChanged(dc.valueChangedEventHandlerToken)
-			dc.valueChangedEventHandler.Release()
+			handler := dc.valueChangedEventHandler
 			dc.valueChangedEventHandler = nil
+			// Grace period before the final release: removal does not wait
+			// for a ValueChanged callback already running on a WinRT thread
+			// (a notification streaming in during disconnect is common), and
+			// freeing the delegate under it crashes the process.
+			time.AfterFunc(2*time.Second, func() { handler.Release() })
 		}
 	}
 	r.notifChars = nil
@@ -528,6 +540,7 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 
 		resources: &deviceResources{},
 		closeOnce: &sync.Once{},
+		closed:    &atomic.Bool{},
 	}
 
 	// https://learn.microsoft.com/es-es/uwp/api/windows.devices.bluetooth.bluetoothledevice.connectionstatuschanged?view=winrt-26100
@@ -539,6 +552,10 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	)
 
 	handler := foundation.NewTypedEventHandler(ole.NewGUID(connectionStatusChangedGUID), func(instance *foundation.TypedEventHandler, sender, arg unsafe.Pointer) {
+		if device.closed.Load() {
+			// Teardown already started; the device object may be released.
+			return
+		}
 		status, err := bleDevice.GetConnectionStatus()
 		if err != nil {
 			return
@@ -581,29 +598,39 @@ func (d Device) Disconnect() error {
 }
 
 func (d Device) disconnect() error {
-	defer d.device.Release()
-	defer d.session.Release()
-	if d.connectionStatusListener != nil {
-		defer d.connectionStatusListener.Release()
+	// Flag first: a ConnectionStatusChanged event racing this teardown checks
+	// it and bails instead of touching soon-to-be-released objects.
+	if d.closed != nil {
+		d.closed.Store(true)
 	}
 
 	d.cancel()
 
-	// Remove any still-active notification handlers and release the service
-	// and characteristic objects discovered on this connection.
+	// Stop future status callbacks, then remove notification handlers and
+	// close the discovered services.
+	_ = d.device.RemoveConnectionStatusChanged(d.connectionStatusListenerToken)
 	d.resources.releaseAll()
 
-	if err := d.session.Close(); err != nil {
-		return err
+	sessErr := d.session.Close()
+	devErr := d.device.Close()
+
+	// Release the COM references after a grace period: WinRT event removal
+	// does not wait for callbacks already running on its threads, and
+	// releasing an object out from under an in-flight callback crashes the
+	// process.
+	dev, session, listener := d.device, d.session, d.connectionStatusListener
+	time.AfterFunc(2*time.Second, func() {
+		dev.Release()
+		session.Release()
+		if listener != nil {
+			listener.Release()
+		}
+	})
+
+	if sessErr != nil {
+		return sessErr
 	}
-
-	_ = d.device.RemoveConnectionStatusChanged(d.connectionStatusListenerToken)
-
-	if err := d.device.Close(); err != nil {
-		return err
-	}
-
-	return nil
+	return devErr
 }
 
 // Connected returns whether the device is currently connected.
