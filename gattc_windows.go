@@ -3,6 +3,7 @@ package bluetooth
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"syscall"
 	"unsafe"
 
@@ -12,6 +13,11 @@ import (
 	"github.com/saltosystems/winrt-go/windows/devices/bluetooth/genericattributeprofile"
 	"github.com/saltosystems/winrt-go/windows/foundation"
 	"github.com/saltosystems/winrt-go/windows/storage/streams"
+)
+
+var (
+	_ GATTCService        = (*DeviceService)(nil)
+	_ GATTCCharacteristic = (*DeviceCharacteristic)(nil)
 )
 
 var (
@@ -29,6 +35,7 @@ var (
 type NotificationMode = genericattributeprofile.GattCharacteristicProperties
 
 const (
+	NotificationModeDisable  NotificationMode = genericattributeprofile.GattCharacteristicPropertiesNone
 	NotificationModeNotify   NotificationMode = genericattributeprofile.GattCharacteristicPropertiesNotify
 	NotificationModeIndicate NotificationMode = genericattributeprofile.GattCharacteristicPropertiesIndicate
 )
@@ -78,6 +85,13 @@ func (d Device) DiscoverServices(filterUUIDs []UUID) ([]DeviceService, error) {
 	}
 
 	var services []DeviceService
+
+	if len(filterUUIDs) > 0 {
+		// The caller wants to get a list of services in a specific
+		// order.
+		services = make([]DeviceService, len(filterUUIDs))
+	}
+
 	for i := uint32(0); i < servicesSize; i++ {
 		s, err := servicesVector.GetAt(i)
 		if err != nil {
@@ -94,29 +108,26 @@ func (d Device) DiscoverServices(filterUUIDs []UUID) ([]DeviceService, error) {
 
 		// only include services that are included in the input filter
 		if len(filterUUIDs) > 0 {
-			found := false
-			for _, uuid := range filterUUIDs {
+			for j, uuid := range filterUUIDs {
 				if serviceUuid.String() == uuid.String() {
 					// One of the services we're looking for.
-					found = true
+					services[j] = makeService(serviceUuid, srv, d)
 					break
 				}
 			}
-			if !found {
-				continue
-			}
+		} else {
+			// The caller wants to get all services, in any order.
+			services = append(services, makeService(serviceUuid, srv, d))
 		}
 
 		go func() {
 			<-d.ctx.Done()
 			srv.Close()
 		}()
+	}
 
-		services = append(services, DeviceService{
-			uuidWrapper: serviceUuid,
-			service:     srv,
-			device:      d,
-		})
+	if slices.Contains(services, (DeviceService{})) {
+		return nil, errors.New("bluetooth: did not find all requested services")
 	}
 
 	return services, nil
@@ -143,8 +154,24 @@ func winRTUuidToUuid(uuid syscall.GUID) UUID {
 // struct method of the same name.
 type uuidWrapper = UUID
 
+// Small helper to create a DeviceService object.
+func makeService(serviceUuid uuidWrapper, srv *genericattributeprofile.GattDeviceService, d Device) DeviceService {
+	svc := DeviceService{
+		deviceService: &deviceService{
+			uuidWrapper: serviceUuid,
+			service:     srv,
+			device:      d,
+		},
+	}
+	return svc
+}
+
 // DeviceService is a BLE service on a connected peripheral device.
 type DeviceService struct {
+	*deviceService
+}
+
+type deviceService struct {
 	uuidWrapper
 
 	service *genericattributeprofile.GattDeviceService
@@ -196,6 +223,13 @@ func (s DeviceService) DiscoverCharacteristics(filterUUIDs []UUID) ([]DeviceChar
 	}
 
 	var characteristics []DeviceCharacteristic
+
+	if len(filterUUIDs) > 0 {
+		// The caller wants to get a list of characteristics in a specific
+		// order.
+		characteristics = make([]DeviceCharacteristic, len(filterUUIDs))
+	}
+
 	for i := uint32(0); i < characteristicsSize; i++ {
 		c, err := charVector.GetAt(i)
 		if err != nil {
@@ -217,39 +251,62 @@ func (s DeviceService) DiscoverCharacteristics(filterUUIDs []UUID) ([]DeviceChar
 
 		// only include characteristics that are included in the input filter
 		if len(filterUUIDs) > 0 {
-			found := false
-			for _, uuid := range filterUUIDs {
+			for j, uuid := range filterUUIDs {
+				if characteristics[j] != (DeviceCharacteristic{}) {
+					// To support multiple identical characteristics, we
+					// need to ignore the characteristics that are already
+					// found. See:
+					// https://github.com/tinygo-org/bluetooth/issues/131
+					continue
+				}
 				if characteristicUUID.String() == uuid.String() {
 					// One of the characteristics we're looking for.
-					found = true
+					characteristics[j] = s.makeCharacteristic(characteristicUUID, characteristic, properties)
 					break
 				}
 			}
-			if !found {
-				continue
-			}
+		} else {
+			// The caller wants to get all characteristics, in any order.
+			characteristics = append(characteristics, s.makeCharacteristic(characteristicUUID, characteristic, properties))
 		}
+	}
 
-		characteristics = append(characteristics, DeviceCharacteristic{
-			uuidWrapper:    characteristicUUID,
-			service:        s,
-			characteristic: characteristic,
-			properties:     properties,
-		})
+	if slices.Contains(characteristics, (DeviceCharacteristic{})) {
+		return nil, errors.New("bluetooth: did not find all requested characteristic")
 	}
 
 	return characteristics, nil
 }
 
+// Small helper to create a DeviceCharacteristic object.
+func (s DeviceService) makeCharacteristic(uuid UUID, characteristic *genericattributeprofile.GattCharacteristic, properties genericattributeprofile.GattCharacteristicProperties) DeviceCharacteristic {
+	char := DeviceCharacteristic{
+		deviceCharacteristic: &deviceCharacteristic{
+			uuidWrapper:    uuid,
+			service:        s,
+			characteristic: characteristic,
+			properties:     properties,
+		},
+	}
+	return char
+}
+
 // DeviceCharacteristic is a BLE characteristic on a connected peripheral
 // device.
 type DeviceCharacteristic struct {
+	*deviceCharacteristic
+}
+
+type deviceCharacteristic struct {
 	uuidWrapper
 
 	characteristic *genericattributeprofile.GattCharacteristic
 	properties     genericattributeprofile.GattCharacteristicProperties
 
 	service DeviceService
+
+	valueChangedEventHandler      *foundation.TypedEventHandler
+	valueChangedEventHandlerToken foundation.EventRegistrationToken
 }
 
 // UUID returns the UUID for this DeviceCharacteristic.
@@ -366,6 +423,10 @@ func (c DeviceCharacteristic) Read(data []byte) (int, error) {
 		return 0, err
 	}
 
+	if bufferlen == 0 {
+		return 0, nil
+	}
+
 	readBuffer, err := datareader.ReadBytes(bufferlen)
 	if err != nil {
 		return 0, err
@@ -377,9 +438,13 @@ func (c DeviceCharacteristic) Read(data []byte) (int, error) {
 
 // EnableNotifications enables notifications or indicate in the Client Characteristic
 // Configuration Descriptor (CCCD). And it favors Notify over Indicate.
+//
+// Users may call EnableNotifications with a nil callback to disable notifications.
 func (c DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) error {
 	var err error
-	if c.properties&genericattributeprofile.GattCharacteristicPropertiesNotify != 0 {
+	if callback == nil {
+		err = c.EnableNotificationsWithMode(NotificationModeDisable, nil)
+	} else if c.properties&genericattributeprofile.GattCharacteristicPropertiesNotify != 0 {
 		err = c.EnableNotificationsWithMode(NotificationModeNotify, callback)
 	} else if c.properties&genericattributeprofile.GattCharacteristicPropertiesIndicate != 0 {
 		err = c.EnableNotificationsWithMode(NotificationModeIndicate, callback)
@@ -396,10 +461,13 @@ func (c DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) err
 // EnableNotificationsWithMode enables notifications in the Client Characteristic
 // Configuration Descriptor (CCCD). This means that most peripherals will send a
 // notification with a new value every time the value of the characteristic
-// changes. And you can select the notify/indicate mode as you need.
+// changes. And you can select the disable/notify/indicate mode as you need.
 func (c DeviceCharacteristic) EnableNotificationsWithMode(mode NotificationMode, callback func(buf []byte)) error {
 	configValue := genericattributeprofile.GattClientCharacteristicConfigurationDescriptorValueNone
-	if mode == NotificationModeIndicate {
+	if mode == NotificationModeDisable {
+		// set to none mode, which disables notifications.
+		configValue = genericattributeprofile.GattClientCharacteristicConfigurationDescriptorValueNone
+	} else if mode == NotificationModeIndicate {
 		if c.properties&genericattributeprofile.GattCharacteristicPropertiesIndicate == 0 {
 			return errNoIndicate
 		}
@@ -415,38 +483,48 @@ func (c DeviceCharacteristic) EnableNotificationsWithMode(mode NotificationMode,
 		return errInvalidNotificationMode
 	}
 
-	// listen value changed event
-	// TypedEventHandler<GattCharacteristic,GattValueChangedEventArgs>
-	guid := winrt.ParameterizedInstanceGUID(foundation.GUIDTypedEventHandler, genericattributeprofile.SignatureGattCharacteristic, genericattributeprofile.SignatureGattValueChangedEventArgs)
-	valueChangedEventHandler := foundation.NewTypedEventHandler(ole.NewGUID(guid), func(instance *foundation.TypedEventHandler, sender, args unsafe.Pointer) {
-		valueChangedEvent := (*genericattributeprofile.GattValueChangedEventArgs)(args)
+	if c.valueChangedEventHandler != nil {
+		_ = c.characteristic.RemoveValueChanged(c.valueChangedEventHandlerToken)
+		c.valueChangedEventHandler.Release()
+		c.valueChangedEventHandler = nil
+	}
 
-		buf, err := valueChangedEvent.GetCharacteristicValue()
+	if mode != NotificationModeDisable {
+		// listen value changed event
+		// TypedEventHandler<GattCharacteristic,GattValueChangedEventArgs>
+		guid := winrt.ParameterizedInstanceGUID(foundation.GUIDTypedEventHandler, genericattributeprofile.SignatureGattCharacteristic, genericattributeprofile.SignatureGattValueChangedEventArgs)
+		valueChangedEventHandler := foundation.NewTypedEventHandler(ole.NewGUID(guid), func(instance *foundation.TypedEventHandler, sender, args unsafe.Pointer) {
+			valueChangedEvent := (*genericattributeprofile.GattValueChangedEventArgs)(args)
+
+			buf, err := valueChangedEvent.GetCharacteristicValue()
+			if err != nil {
+				return
+			}
+
+			reader, err := streams.DataReaderFromBuffer(buf)
+			if err != nil {
+				return
+			}
+			defer reader.Release()
+
+			buflen, err := buf.GetLength()
+			if err != nil {
+				return
+			}
+
+			data, err := reader.ReadBytes(buflen)
+			if err != nil {
+				return
+			}
+
+			callback(data)
+		})
+		token, err := c.characteristic.AddValueChanged(valueChangedEventHandler)
 		if err != nil {
-			return
+			return err
 		}
-
-		reader, err := streams.DataReaderFromBuffer(buf)
-		if err != nil {
-			return
-		}
-		defer reader.Release()
-
-		buflen, err := buf.GetLength()
-		if err != nil {
-			return
-		}
-
-		data, err := reader.ReadBytes(buflen)
-		if err != nil {
-			return
-		}
-
-		callback(data)
-	})
-	_, err := c.characteristic.AddValueChanged(valueChangedEventHandler)
-	if err != nil {
-		return err
+		c.valueChangedEventHandlerToken = token
+		c.valueChangedEventHandler = valueChangedEventHandler
 	}
 
 	writeOp, err := c.characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(configValue)

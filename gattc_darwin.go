@@ -2,9 +2,20 @@ package bluetooth
 
 import (
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/tinygo-org/cbgo"
+)
+
+var (
+	errWriteWithoutResponseTimeout = errors.New("bluetooth: write without response timed out waiting for buffer space")
+	errTimeoutEnableNotifications  = errors.New("timeout on EnableNotifications")
+)
+
+var (
+	_ GATTCService        = (*DeviceService)(nil)
+	_ GATTCCharacteristic = (*DeviceCharacteristic)(nil)
 )
 
 // DiscoverServices starts a service discovery procedure. Pass a list of service
@@ -15,7 +26,16 @@ import (
 // Passing a nil slice of UUIDs will return a complete list of
 // services.
 func (d Device) DiscoverServices(uuids []UUID) ([]DeviceService, error) {
-	d.prph.DiscoverServices([]cbgo.UUID{})
+	cbuuids := make([]cbgo.UUID, len(uuids))
+	for i, u := range uuids {
+		cbuuid, err := cbgo.ParseUUID(u.String())
+		if err != nil {
+			return nil, err
+		}
+		cbuuids[i] = cbuuid
+	}
+
+	d.prph.DiscoverServices(cbuuids)
 
 	// clear cache of services
 	d.services = make(map[UUID]DeviceService)
@@ -24,33 +44,34 @@ func (d Device) DiscoverServices(uuids []UUID) ([]DeviceService, error) {
 	select {
 	case <-d.servicesChan:
 		svcs := []DeviceService{}
+
+		if len(uuids) > 0 {
+			// The caller wants to get a list of services in a specific
+			// order.
+			svcs = make([]DeviceService, len(uuids))
+		}
+
 		for _, dsvc := range d.prph.Services() {
 			dsvcuuid, _ := ParseUUID(dsvc.UUID().String())
-			// add if in our original list
+
+			// only include services that are included in the input filter
 			if len(uuids) > 0 {
-				found := false
-				for _, uuid := range uuids {
+				for j, uuid := range uuids {
 					if dsvcuuid.String() == uuid.String() {
-						// one of the services we're looking for.
-						found = true
-						break
+						// One of the services we're looking for.
+						svcs[j] = d.makeService(dsvcuuid, dsvc)
 					}
 				}
-				if !found {
-					continue
-				}
+			} else {
+				// The caller wants to get all services, in any order.
+				svcs = append(svcs, d.makeService(dsvcuuid, dsvc))
 			}
-
-			svc := DeviceService{
-				deviceService: &deviceService{
-					uuidWrapper: dsvcuuid,
-					device:      d,
-					service:     dsvc,
-				},
-			}
-			svcs = append(svcs, svc)
-			d.services[svc.uuidWrapper] = svc
 		}
+
+		if slices.Contains(svcs, (DeviceService{})) {
+			return nil, errors.New("bluetooth: did not find all requested services")
+		}
+
 		return svcs, nil
 	case <-time.NewTimer(10 * time.Second).C:
 		return nil, errors.New("timeout on DiscoverServices")
@@ -60,6 +81,20 @@ func (d Device) DiscoverServices(uuids []UUID) ([]DeviceService, error) {
 // uuidWrapper is a type alias for UUID so we ensure no conflicts with
 // struct method of the same name.
 type uuidWrapper = UUID
+
+// Small helper to create a DeviceService object.
+func (d Device) makeService(dsvcuuid uuidWrapper, dsvc cbgo.Service) DeviceService {
+	svc := DeviceService{
+		deviceService: &deviceService{
+			uuidWrapper: dsvcuuid,
+			device:      d,
+			service:     dsvc,
+		},
+	}
+	// Cache the service in the device's services map, so that we can find it
+	d.services[svc.uuidWrapper] = svc
+	return svc
+}
 
 // DeviceService is a BLE service on a connected peripheral device.
 type DeviceService struct {
@@ -90,7 +125,14 @@ func (s DeviceService) UUID() UUID {
 // Passing a nil slice of UUIDs will return a complete list of
 // characteristics.
 func (s DeviceService) DiscoverCharacteristics(uuids []UUID) ([]DeviceCharacteristic, error) {
-	cbuuids := []cbgo.UUID{}
+	cbuuids := make([]cbgo.UUID, len(uuids))
+	for i, u := range uuids {
+		cbuuid, err := cbgo.ParseUUID(u.String())
+		if err != nil {
+			return nil, err
+		}
+		cbuuids[i] = cbuuid
+	}
 
 	s.device.prph.DiscoverCharacteristics(cbuuids, s.service)
 
@@ -169,6 +211,7 @@ type deviceCharacteristic struct {
 	callback       func(buf []byte)
 	readChan       chan error
 	writeChan      chan error
+	notifyChan     chan error
 }
 
 // UUID returns the UUID for this DeviceCharacteristic.
@@ -199,10 +242,22 @@ func (c DeviceCharacteristic) Write(p []byte) (n int, err error) {
 
 // WriteWithoutResponse replaces the characteristic value with a new value. The
 // call will return before all data has been written. A limited number of such
-// writes can be in flight at any given time. This call is also known as a
-// "write command" (as opposed to a write request).
-func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (n int, err error) {
-	c.service.device.prph.WriteCharacteristic(p, c.characteristic, false)
+// writes can be in flight at any given time.
+// If the peripheral's buffer is full, this method polls
+// CanSendWriteWithoutResponse every 15ms (one BLE connection interval) until
+// ready, with a 10-second timeout.
+func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (int, error) {
+	dev := c.service.device
+
+	deadline := time.Now().Add(10 * time.Second)
+	for !dev.prph.CanSendWriteWithoutResponse() {
+		if time.Now().After(deadline) {
+			return 0, errWriteWithoutResponseTimeout
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	dev.prph.WriteCharacteristic(p, c.characteristic, false)
 
 	return len(p), nil
 }
@@ -211,13 +266,36 @@ func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (n int, err error) 
 // Configuration Descriptor (CCCD). This means that most peripherals will send a
 // notification with a new value every time the value of the characteristic
 // changes.
+// Users may call EnableNotifications with a nil callback to disable notifications.
 func (c DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) error {
+	c.notifyChan = make(chan error)
+
 	if callback == nil {
-		return errors.New("must provide a callback for EnableNotifications")
+		c.service.device.prph.SetNotify(false, c.characteristic)
+	} else {
+		c.callback = callback
+		c.service.device.prph.SetNotify(true, c.characteristic)
 	}
 
-	c.callback = callback
-	c.service.device.prph.SetNotify(true, c.characteristic)
+	// Wait for CoreBluetooth to confirm the notification state change.
+	var err error
+	select {
+	case err = <-c.notifyChan:
+	case <-time.After(10 * time.Second):
+		err = errTimeoutEnableNotifications
+	}
+
+	c.notifyChan = nil
+
+	if err != nil {
+		c.callback = nil
+		return err
+	}
+
+	// Clear callback after confirmed disable.
+	if callback == nil {
+		c.callback = nil
+	}
 
 	return nil
 }

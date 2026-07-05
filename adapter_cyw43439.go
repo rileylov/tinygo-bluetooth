@@ -12,6 +12,8 @@ import (
 
 const maxConnections = 1
 
+var _ BLEAdapter = (*Adapter)(nil)
+
 // Adapter represents a SPI connection to the HCI controller on an attached CYW4349 module.
 type Adapter struct {
 	hciAdapter
@@ -66,6 +68,11 @@ func (a *Adapter) Enable() error {
 		println("Enabled CYW43439 device")
 	}
 
+	return nil
+}
+
+// Reset is a no-op on CYW43439. Provided for interface symmetry.
+func (a *Adapter) Reset() error {
 	return nil
 }
 

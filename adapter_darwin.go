@@ -8,6 +8,8 @@ import (
 	"github.com/tinygo-org/cbgo"
 )
 
+var _ BLEAdapter = (*Adapter)(nil)
+
 // Adapter is a connection to BLE devices.
 type Adapter struct {
 	cmd *centralManagerDelegate
@@ -42,21 +44,30 @@ var DefaultAdapter = &Adapter{
 
 // Enable configures the BLE stack. It must be called before any
 // Bluetooth-related calls (unless otherwise indicated).
+//
+// poweredChan is cleared on both success and timeout paths so
+// a subsequent Enable() on the same Adapter can run again.
 func (a *Adapter) Enable() error {
 	if a.poweredChan != nil {
 		return errors.New("already calling Enable function")
 	}
 
-	// wait until powered
 	a.poweredChan = make(chan error, 1)
 
+	// Set delegate before checking state — a fresh CBCentralManager
+	// can fire DidUpdateState before SetDelegate, losing the event.
 	a.cmd = &centralManagerDelegate{a: a}
 	a.cm.SetDelegate(a.cmd)
 
 	if a.cm.State() != cbgo.ManagerStatePoweredOn {
 		select {
-		case <-a.poweredChan:
+		case err := <-a.poweredChan:
+			if err != nil {
+				a.poweredChan = nil
+				return err
+			}
 		case <-time.NewTimer(10 * time.Second).C:
+			a.poweredChan = nil
 			return errors.New("timeout enabling CentralManager")
 		}
 	}
@@ -66,9 +77,46 @@ func (a *Adapter) Enable() error {
 		<-a.poweredChan
 	}
 
-	// wait until powered?
 	a.pmd = &peripheralManagerDelegate{a: a}
 	a.pm.SetDelegate(a.pmd)
+
+	a.poweredChan = nil
+
+	return nil
+}
+
+// Reset tears down CoreBluetooth managers so a subsequent Enable()
+// rebuilds them from scratch. Useful for recovering from stale
+// CBPeripheral handles, adapter switching, and test cleanup.
+//
+// Caller must ensure no Scan/Connect/DiscoverServices is in flight.
+// After Reset, call Enable() to create fresh managers.
+//
+// Note: process-level CoreBluetooth state (e.g. the advertisement
+// deduplication table) survives Reset — only process exit clears it.
+func (a *Adapter) Reset() error {
+	if a.scanChan != nil {
+		_ = a.StopScan()
+	}
+
+	// Unblock goroutines parked in Connect — closing the chan
+	// yields a zero Peripheral so Connect returns an error.
+	a.connectMap.Range(func(key, value any) bool {
+		a.connectMap.Delete(key)
+		if ch, ok := value.(chan cbgo.Peripheral); ok {
+			defer func() { _ = recover() }()
+			close(ch)
+		}
+		return true
+	})
+
+	a.cm = cbgo.NewCentralManager(nil)
+	a.pm = cbgo.NewPeripheralManager(nil)
+	a.cmd = nil
+	a.pmd = nil
+	a.poweredChan = nil
+	a.scanChan = nil
+	a.peripheralFoundHandler = nil
 
 	return nil
 }
@@ -83,12 +131,25 @@ type centralManagerDelegate struct {
 
 // CentralManagerDidUpdateState when central manager state updated.
 func (cmd *centralManagerDelegate) CentralManagerDidUpdateState(cmgr cbgo.CentralManager) {
-	// powered on?
-	if cmgr.State() == cbgo.ManagerStatePoweredOn {
-		cmd.a.poweredChan <- nil
+	var event error
+	switch cmgr.State() {
+	case cbgo.ManagerStatePoweredOn:
+		event = nil
+	case cbgo.ManagerStatePoweredOff:
+		event = errors.New("bluetooth is powered off")
+	case cbgo.ManagerStateUnsupported:
+		event = errors.New("bluetooth is not supported on this device")
+	case cbgo.ManagerStateUnauthorized:
+		event = errors.New("bluetooth is not authorized for this app")
+	default:
+		return
 	}
-
-	// TODO: handle other state changes.
+	// Non-blocking send: poweredChan may be nil after Enable
+	// completes, or already buffered.
+	select {
+	case cmd.a.poweredChan <- event:
+	default:
+	}
 }
 
 // DidDiscoverPeripheral when peripheral is discovered.
@@ -127,6 +188,17 @@ func (cmd *centralManagerDelegate) DidConnectPeripheral(cmgr cbgo.CentralManager
 	// ignore this connection.
 	if ch, ok := cmd.a.connectMap.LoadAndDelete(id); ok {
 		// Unblock now that we're connected.
+		ch.(chan cbgo.Peripheral) <- prph
+	}
+}
+
+// DidFailToConnectPeripheral when peripheral connection fails.
+func (cmd *centralManagerDelegate) DidFailToConnectPeripheral(cmgr cbgo.CentralManager, prph cbgo.Peripheral, err error) {
+	id := prph.Identifier().String()
+
+	// Send the peripheral through so Connect can check its state
+	// and return the appropriate error.
+	if ch, ok := cmd.a.connectMap.LoadAndDelete(id); ok {
 		ch.(chan cbgo.Peripheral) <- prph
 	}
 }

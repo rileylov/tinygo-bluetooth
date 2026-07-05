@@ -41,6 +41,8 @@ func init() {
 	secModeOpen.set_bitfield_lv(1)
 }
 
+var _ BLEAdapter = (*Adapter)(nil)
+
 // Adapter is a dummy adapter: it represents the connection to the (only)
 // SoftDevice on the chip.
 type Adapter struct {
@@ -110,6 +112,11 @@ func (a *Adapter) Enable() error {
 
 	errCode = C.sd_ble_gap_ppcp_set(&gapConnParams)
 	return makeError(errCode)
+}
+
+// Reset is a no-op on SoftDevice. Provided for interface symmetry.
+func (a *Adapter) Reset() error {
+	return nil
 }
 
 // DisableInterrupts must be used instead of disabling interrupts directly, to

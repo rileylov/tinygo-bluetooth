@@ -83,6 +83,8 @@ func (a *Adapter) StopScan() error {
 	return nil
 }
 
+var _ GAPDevice = Device{}
+
 // Device is a connection to a remote peripheral.
 type Device struct {
 	Address Address
@@ -176,6 +178,11 @@ func (d Device) Disconnect() error {
 	return nil
 }
 
+// Connected returns whether the device is currently connected.
+func (d Device) Connected() (bool, error) {
+	return d.prph.State() == cbgo.PeripheralStateConnected, nil
+}
+
 // RequestConnectionParams requests a different connection latency and timeout
 // of the given device connection. Fields that are unset will be left alone.
 // Whether or not the device will actually honor this, depends on the device and
@@ -220,7 +227,7 @@ func (pd *peripheralDelegate) DidUpdateValueForCharacteristic(prph cbgo.Peripher
 
 			if char.characteristic == chr && uuid == char.UUID() { // compare pointers
 				if err == nil && char.callback != nil {
-					go char.callback(chr.Value())
+					char.callback(chr.Value())
 				}
 
 				if char.readChan != nil {
@@ -244,6 +251,23 @@ func (pd *peripheralDelegate) DidWriteValueForCharacteristic(_ cbgo.Peripheral, 
 			if char.characteristic == chr && uuid == char.UUID() { // compare pointers
 				if char.writeChan != nil {
 					char.writeChan <- err
+				}
+			}
+		}
+	}
+}
+
+// DidUpdateNotificationState is called when the notification state for a characteristic
+// has been updated. It reports whether enabling/disabling notifications succeeded.
+func (pd *peripheralDelegate) DidUpdateNotificationState(prph cbgo.Peripheral, chr cbgo.Characteristic, err error) {
+	uuid, _ := ParseUUID(chr.UUID().String())
+	svcuuid, _ := ParseUUID(chr.Service().UUID().String())
+
+	if svc, ok := pd.d.services[svcuuid]; ok {
+		for _, char := range svc.characteristics {
+			if char.characteristic == chr && uuid == char.UUID() {
+				if char.notifyChan != nil {
+					char.notifyChan <- err
 				}
 			}
 		}

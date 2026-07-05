@@ -43,6 +43,10 @@ func handleEvent() {
 				connectionAttempt.connectionHandle = gapEvent.conn_handle
 				connectionAttempt.state.Set(2) // connection was successful
 				DefaultAdapter.connectHandler(device, true)
+			default:
+				if debug {
+					println("evt: connected in unknown role")
+				}
 			}
 		case C.BLE_GAP_EVT_DISCONNECTED:
 			if debug {
@@ -96,24 +100,38 @@ func handleEvent() {
 			// report has been processed.
 			gotScanReport.Set(1)
 		case C.BLE_GAP_EVT_CONN_PARAM_UPDATE_REQUEST:
-			// Respond with the default PPCP connection parameters by passing
-			// nil:
-			// > If NULL is provided on a peripheral role, the parameters in the
-			// > PPCP characteristic of the GAP service will be used instead. If
-			// > NULL is provided on a central role and in response to a
-			// > BLE_GAP_EVT_CONN_PARAM_UPDATE_REQUEST, the peripheral request
-			// > will be rejected
-			C.sd_ble_gap_conn_param_update(gapEvent.conn_handle, nil)
+			request := gapEvent.params.unionfield_conn_param_update_request()
+			if debug {
+				interval_min_ms := request.conn_params.min_conn_interval * 125 / 100
+				interval_max_ms := request.conn_params.max_conn_interval * 125 / 100
+				timeout_ms := request.conn_params.conn_sup_timeout * 10
+				print("evt: gap connection param update request min=", interval_min_ms, "ms max=", interval_max_ms, "ms latency=", request.conn_params.slave_latency, " timeout=", timeout_ms, "ms\r\n")
+			}
+			// Accept the requested connection parameter update (some
+			// peripherals don't like it when their requests get rejected).
+			C.sd_ble_gap_conn_param_update(gapEvent.conn_handle, &request.conn_params)
 		case C.BLE_GAP_EVT_DATA_LENGTH_UPDATE_REQUEST:
+			if debug {
+				println("evt: gap data length update request")
+			}
 			// We need to respond with sd_ble_gap_data_length_update. Setting
 			// both parameters to nil will make sure we send the default values.
 			C.sd_ble_gap_data_length_update(gapEvent.conn_handle, nil, nil)
 		case C.BLE_GAP_EVT_DATA_LENGTH_UPDATE:
+			if debug {
+				println("evt: gap data length updated")
+			}
 			// ignore confirmation of data length successfully updated
 		case C.BLE_GAP_EVT_PHY_UPDATE_REQUEST:
+			if debug {
+				println("evt: gap phy update request")
+			}
 			// Tell the Bluetooth stack to update the PHY as it sees fit.
 			C.sd_ble_gap_phy_update(gapEvent.conn_handle, &phyUpdateResponse)
 		case C.BLE_GAP_EVT_PHY_UPDATE:
+			if debug {
+				println("evt: gap phy update")
+			}
 			// ignore confirmation of phy successfully updated
 		case C.BLE_GAP_EVT_TIMEOUT:
 			timeoutEvt := gapEvent.params.unionfield_timeout()
@@ -254,7 +272,13 @@ func handleEvent() {
 						break
 					}
 				}
+			default:
+				if debug {
+					println("evt: unknown HVX")
+				}
 			}
+		case C.BLE_GATTC_EVT_WRITE_CMD_TX_COMPLETE:
+			// not handled at the moment
 		default:
 			if debug {
 				println("unknown GATTC event:", id, id-C.BLE_GATTC_EVT_BASE)

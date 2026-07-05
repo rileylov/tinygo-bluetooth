@@ -8,6 +8,8 @@ import (
 
 const maxConnections = 1
 
+var _ BLEAdapter = (*Adapter)(nil)
+
 // Adapter represents a "plain" UART connection to the HCI controller.
 type Adapter struct {
 	hciAdapter
@@ -66,6 +68,11 @@ func (a *Adapter) Enable() error {
 	a.hci, a.att = newBLEStack(transport)
 	a.enable()
 
+	return nil
+}
+
+// Reset is a no-op on HCI UART. Provided for interface symmetry.
+func (a *Adapter) Reset() error {
 	return nil
 }
 

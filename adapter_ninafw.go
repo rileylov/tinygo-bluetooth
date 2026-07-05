@@ -9,6 +9,8 @@ import (
 
 const maxConnections = 1
 
+var _ BLEAdapter = (*Adapter)(nil)
+
 // Adapter represents the HCI connection to the NINA fw using the hardware UART.
 type Adapter struct {
 	hciAdapter
@@ -64,6 +66,11 @@ func (a *Adapter) Enable() error {
 
 	a.hci, a.att = newBLEStack(transport)
 	return a.enable()
+}
+
+// Reset is a no-op on NINA. Provided for interface symmetry.
+func (a *Adapter) Reset() error {
+	return nil
 }
 
 func resetNINA() {

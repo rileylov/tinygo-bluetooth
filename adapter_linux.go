@@ -14,6 +14,8 @@ import (
 
 const defaultAdapter = "hci0"
 
+var _ BLEAdapter = (*Adapter)(nil)
+
 type Adapter struct {
 	id                   string
 	scanCancelChan       chan struct{}
@@ -61,6 +63,17 @@ func (a *Adapter) Enable() (err error) {
 	}
 	addr.Store(&a.address)
 
+	return nil
+}
+
+// Reset clears BlueZ state so a subsequent Enable() rebuilds it.
+// Mostly a no-op on Linux; provided for interface symmetry.
+func (a *Adapter) Reset() error {
+	a.bus = nil
+	a.bluez = nil
+	a.adapter = nil
+	a.address = ""
+	a.scanCancelChan = nil
 	return nil
 }
 
