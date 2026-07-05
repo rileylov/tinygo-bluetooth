@@ -1,4 +1,4 @@
-//go:build !baremetal
+//go:build !baremetal && !android
 
 // Some documentation for the BlueZ D-Bus interface:
 // https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc
