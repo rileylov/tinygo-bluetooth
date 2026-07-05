@@ -240,6 +240,13 @@ func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) er
 	return nil
 }
 
+// GetMTU returns the MTU for the characteristic. Reading the negotiated MTU is
+// not wired through the Android shim yet (it would need requestMtu +
+// onMtuChanged plumbing in GoBle.java), so this reports not supported.
+func (c DeviceCharacteristic) GetMTU() (uint16, error) {
+	return 0, errNotSupported
+}
+
 // deliverNotify routes a characteristic-changed event to its callback.
 func (a *Adapter) deliverNotify(addr, chr string, val []byte) {
 	key := strings.ToLower(chr)

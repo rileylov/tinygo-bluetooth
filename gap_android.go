@@ -102,6 +102,26 @@ type Device struct {
 	address string // MAC string, for JNI calls
 }
 
+var _ GAPDevice = Device{}
+
+// Connected returns whether the device is currently connected.
+func (d Device) Connected() (bool, error) {
+	if d.adapter == nil {
+		return false, nil
+	}
+	dev := d.adapter.device(d.address)
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+	return dev.connected, nil
+}
+
+// RequestConnectionParams requests a different connection latency and timeout
+// for this connection. The Android stack chooses its own parameters, so this
+// is a no-op — matching the Linux backend.
+func (d Device) RequestConnectionParams(params ConnectionParams) error {
+	return nil
+}
+
 // Connect starts a connection attempt to the given peripheral and blocks until
 // it is connected (or the attempt fails / times out).
 func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, error) {
@@ -135,6 +155,10 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 		return Device{}, fmt.Errorf("bluetooth: connection failed (status %d)", status)
 	}
 
+	d.mu.Lock()
+	d.connected = true
+	d.mu.Unlock()
+
 	dev := Device{Address: address, adapter: a, address: addr}
 	if a.connectHandler != nil {
 		a.connectHandler(dev, true)
@@ -147,6 +171,7 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 func (a *Adapter) signalDisconnect(addr string, status int) {
 	d := a.device(addr)
 	d.mu.Lock()
+	d.connected = false
 	pending := d.connectCh
 	d.mu.Unlock()
 	if pending != nil {
@@ -165,8 +190,14 @@ func (a *Adapter) signalDisconnect(addr string, status int) {
 
 // Disconnect closes the connection to the device. It is non-blocking.
 func (d Device) Disconnect() error {
-	if d.adapter != nil && d.adapter.connectHandler != nil {
-		d.adapter.connectHandler(d, false)
+	if d.adapter != nil {
+		dev := d.adapter.device(d.address)
+		dev.mu.Lock()
+		dev.connected = false
+		dev.mu.Unlock()
+		if d.adapter.connectHandler != nil {
+			d.adapter.connectHandler(d, false)
+		}
 	}
 	jniDisconnect(d.address)
 	return nil

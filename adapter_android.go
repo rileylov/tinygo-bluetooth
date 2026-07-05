@@ -172,6 +172,8 @@ func jniPoll(timeoutMs int64) []byte {
 
 // ---- adapter ----
 
+var _ BLEAdapter = (*Adapter)(nil)
+
 type Adapter struct {
 	initMu  sync.Mutex
 	enabled bool
@@ -248,6 +250,29 @@ func (a *Adapter) Enable() error {
 	return nil
 }
 
+// Reset restores the adapter to a usable in-process state: it stops any
+// running scan and fails any Connect calls still waiting on a result. The
+// Java shim and the event pump keep running.
+func (a *Adapter) Reset() error {
+	_ = a.StopScan() // an errNotScanning result is fine here
+
+	a.devMu.Lock()
+	devs := make([]*androidDevice, 0, len(a.devices))
+	for _, d := range a.devices {
+		devs = append(devs, d)
+	}
+	a.devMu.Unlock()
+	for _, d := range devs {
+		d.mu.Lock()
+		ch := d.connectCh
+		d.mu.Unlock()
+		// Unblock a pending Connect with a failure status (bit 16 set marks a
+		// local abort, mirroring signalDisconnect).
+		trySendInt(ch, 0x1ffff)
+	}
+	return nil
+}
+
 // enqueue hands a user callback to the dispatcher goroutine. Non-blocking: if
 // the queue is full (a callback is stuck), the event is dropped with a log line
 // rather than stalling the pump.
@@ -285,7 +310,8 @@ type readResult struct {
 type androidDevice struct {
 	address string
 
-	mu         sync.Mutex // guards the one-shot waiter channels below
+	mu         sync.Mutex // guards the one-shot waiter channels + connected below
+	connected  bool
 	connectCh  chan int
 	servicesCh chan int
 	writeCh    chan int
