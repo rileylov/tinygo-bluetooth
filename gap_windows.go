@@ -158,9 +158,45 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) (err error) {
 		advertisement.SignatureBluetoothLEAdvertisementWatcher,
 		advertisement.SignatureBluetoothLEAdvertisementReceivedEventArgs,
 	)
+	// Windows delivers a device's advertisement and its scan response as two
+	// separate Received events and never combines them — but the fields are
+	// split across the two (LEGO hubs, for example, put the service UUIDs in
+	// the advertisement and the custom device name in the scan response).
+	// BlueZ and Android merge the pair in the OS; do the same here so every
+	// ScanResult carries the union of what the device sent. The cache holds
+	// one small entry per unique address and lives only for this scan.
+	type advCache struct {
+		name             string
+		serviceUUIDs     []UUID
+		manufacturerData []ManufacturerDataElement
+	}
+	var mergeMu sync.Mutex
+	merged := make(map[Address]advCache)
+
 	handler := foundation.NewTypedEventHandler(ole.NewGUID(eventReceivedGuid), func(instance *foundation.TypedEventHandler, sender, arg unsafe.Pointer) {
 		args := (*advertisement.BluetoothLEAdvertisementReceivedEventArgs)(arg)
 		result := getScanResultFromArgs(args)
+		if fields, ok := result.AdvertisementPayload.(*advertisementFields); ok {
+			mergeMu.Lock()
+			c := merged[result.Address]
+			if fields.AdvertisementFields.LocalName == "" {
+				fields.AdvertisementFields.LocalName = c.name
+			} else {
+				c.name = fields.AdvertisementFields.LocalName
+			}
+			if len(fields.AdvertisementFields.ServiceUUIDs) == 0 {
+				fields.AdvertisementFields.ServiceUUIDs = c.serviceUUIDs
+			} else {
+				c.serviceUUIDs = fields.AdvertisementFields.ServiceUUIDs
+			}
+			if len(fields.AdvertisementFields.ManufacturerData) == 0 {
+				fields.AdvertisementFields.ManufacturerData = c.manufacturerData
+			} else {
+				c.manufacturerData = fields.AdvertisementFields.ManufacturerData
+			}
+			merged[result.Address] = c
+			mergeMu.Unlock()
+		}
 		callback(a, result)
 	})
 	defer handler.Release()
