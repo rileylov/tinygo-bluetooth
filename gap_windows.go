@@ -398,19 +398,12 @@ type Device struct {
 type deviceResources struct {
 	mu         sync.Mutex
 	services   []*genericattributeprofile.GattDeviceService
-	chars      []*genericattributeprofile.GattCharacteristic
 	notifChars []*deviceCharacteristic // wrappers holding an active ValueChanged handler
 }
 
 func (r *deviceResources) addService(s *genericattributeprofile.GattDeviceService) {
 	r.mu.Lock()
 	r.services = append(r.services, s)
-	r.mu.Unlock()
-}
-
-func (r *deviceResources) addChar(c *genericattributeprofile.GattCharacteristic) {
-	r.mu.Lock()
-	r.chars = append(r.chars, c)
 	r.mu.Unlock()
 }
 
@@ -426,8 +419,17 @@ func (r *deviceResources) addNotifChar(dc *deviceCharacteristic) {
 	r.mu.Unlock()
 }
 
-// releaseAll removes still-registered notification handlers and releases every
-// tracked service and characteristic. Called once, from Disconnect.
+// releaseAll removes still-registered notification handlers and closes every
+// tracked service. Called once, from Disconnect.
+//
+// Only backend-owned objects are fully Released here. The service and
+// characteristic wrappers handed out to applications are left alive: an
+// application goroutine can still be inside a Read or Write on them when a
+// remote disconnect triggers this cleanup (a heartbeat read racing the drop
+// is the classic case), and releasing a COM object under an in-flight call
+// crashes the process. With the session closed those calls fail cleanly
+// instead. The unreleased wrappers are small, and this matches upstream's
+// lifetime behavior.
 func (r *deviceResources) releaseAll() {
 	if r == nil {
 		return
@@ -442,13 +444,8 @@ func (r *deviceResources) releaseAll() {
 		}
 	}
 	r.notifChars = nil
-	for _, c := range r.chars {
-		c.Release()
-	}
-	r.chars = nil
 	for _, s := range r.services {
 		_ = s.Close()
-		s.Release()
 	}
 	r.services = nil
 }

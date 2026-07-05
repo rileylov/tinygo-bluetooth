@@ -124,8 +124,8 @@ func (d Device) DiscoverServices(filterUUIDs []UUID) ([]DeviceService, error) {
 		}
 
 		// Track every service (matched or filtered out) so Disconnect closes
-		// and releases it. This replaces the previous goroutine-per-service
-		// waiting on ctx.Done(), which closed but never released the object.
+		// it. This replaces the previous goroutine-per-service waiting on
+		// ctx.Done() to do the same.
 		if d.resources != nil {
 			d.resources.addService(srv)
 		}
@@ -245,11 +245,6 @@ func (s DeviceService) DiscoverCharacteristics(filterUUIDs []UUID) ([]DeviceChar
 		}
 
 		characteristic := (*genericattributeprofile.GattCharacteristic)(c)
-		// Track every characteristic (matched or filtered out) so Disconnect
-		// releases it; previously these objects were never released at all.
-		if res := s.device.resources; res != nil {
-			res.addChar(characteristic)
-		}
 		guid, err := characteristic.GetUuid()
 		if err != nil {
 			return nil, err
