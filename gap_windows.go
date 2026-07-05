@@ -143,7 +143,6 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) (err error) {
 	if err != nil {
 		return
 	}
-	a.watcher = watcher
 	defer func() {
 		// Same grace period as the event handlers below: a Received event can
 		// still be running on a WinRT thread as the scan winds down.
@@ -260,6 +259,13 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) (err error) {
 	if err != nil {
 		return err
 	}
+
+	// Publish the watcher only now that it is fully wired up and running.
+	// Publishing earlier lets a concurrent StopScan fire before the Stopped
+	// listener is attached — that event is then lost and this function waits
+	// on stoppingChan forever, with every later Scan failing as "already in
+	// progress" until the process restarts.
+	a.watcher = watcher
 
 	// Wait until advertisement has stopped, and finish.
 	return <-stoppingChan
