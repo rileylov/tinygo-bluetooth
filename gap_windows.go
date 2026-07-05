@@ -454,12 +454,25 @@ func (r *deviceResources) releaseAll() {
 		if dc.valueChangedEventHandler != nil {
 			_ = dc.characteristic.RemoveValueChanged(dc.valueChangedEventHandlerToken)
 			handler := dc.valueChangedEventHandler
+			char := dc.characteristic
 			dc.valueChangedEventHandler = nil
-			// Grace period before the final release: removal does not wait
-			// for a ValueChanged callback already running on a WinRT thread
-			// (a notification streaming in during disconnect is common), and
-			// freeing the delegate under it crashes the process.
-			time.AfterFunc(2*time.Second, func() { handler.Release() })
+			// The characteristic must be released along with the handler: if
+			// the link is already down (a graceful disconnect command from
+			// the app commonly beats this cleanup), the Remove above fails
+			// silently and WinRT keeps its reference on the delegate — only
+			// destroying the characteristic, and with it the event source,
+			// drops that reference. A delegate that never reaches refcount
+			// zero pins native memory plus a keepalive goroutine with a
+			// running timer, forever, per subscription per connection.
+			//
+			// The grace period lets callbacks and calls already in flight
+			// finish, and the connectionClosed guards on the characteristic
+			// methods turn any later application call into a clean error
+			// instead of a use-after-free.
+			time.AfterFunc(2*time.Second, func() {
+				handler.Release()
+				char.Release()
+			})
 		}
 	}
 	r.notifChars = nil

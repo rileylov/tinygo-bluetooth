@@ -48,6 +48,9 @@ const (
 // Passing a nil slice of UUIDs will return a complete list of
 // services.
 func (d Device) DiscoverServices(filterUUIDs []UUID) ([]DeviceService, error) {
+	if d.closed != nil && d.closed.Load() {
+		return nil, errDeviceDisconnected
+	}
 	// IAsyncOperation<GattDeviceServicesResult>
 	getServicesOperation, err := d.device.GetGattServicesWithCacheModeAsync(bluetooth.BluetoothCacheModeUncached)
 	if err != nil {
@@ -198,6 +201,9 @@ func (s DeviceService) UUID() UUID {
 // Passing a nil slice of UUIDs will return a complete
 // list of characteristics.
 func (s DeviceService) DiscoverCharacteristics(filterUUIDs []UUID) ([]DeviceCharacteristic, error) {
+	if d := s.device; d.closed != nil && d.closed.Load() {
+		return nil, errDeviceDisconnected
+	}
 	getCharacteristicsOp, err := s.service.GetCharacteristicsWithCacheModeAsync(bluetooth.BluetoothCacheModeUncached)
 	if err != nil {
 		return nil, err
@@ -322,12 +328,28 @@ func (c DeviceCharacteristic) UUID() UUID {
 	return c.uuidWrapper
 }
 
+var errDeviceDisconnected = errors.New("bluetooth: device has been disconnected")
+
+// connectionClosed reports whether the connection this characteristic belongs
+// to has been torn down. Its COM objects may already be released, so every
+// method that touches them checks this first and fails cleanly instead.
+func (c DeviceCharacteristic) connectionClosed() bool {
+	if c.deviceCharacteristic == nil {
+		return true
+	}
+	d := c.service.device
+	return d.closed != nil && d.closed.Load()
+}
+
 func (c DeviceCharacteristic) Properties() uint32 {
 	return uint32(c.properties)
 }
 
 // GetMTU returns the MTU for the characteristic.
 func (c DeviceCharacteristic) GetMTU() (uint16, error) {
+	if c.connectionClosed() {
+		return 0, errDeviceDisconnected
+	}
 	return c.service.device.session.GetMaxPduSize()
 }
 
@@ -353,6 +375,9 @@ func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (n int, err error) 
 }
 
 func (c DeviceCharacteristic) write(p []byte, mode genericattributeprofile.GattWriteOption) (n int, err error) {
+	if c.connectionClosed() {
+		return 0, errDeviceDisconnected
+	}
 	// Convert data to buffer
 	writer, err := streams.NewDataWriter()
 	if err != nil {
@@ -400,6 +425,9 @@ func (c DeviceCharacteristic) write(p []byte, mode genericattributeprofile.GattW
 
 // Read reads the current characteristic value.
 func (c DeviceCharacteristic) Read(data []byte) (int, error) {
+	if c.connectionClosed() {
+		return 0, errDeviceDisconnected
+	}
 	if c.properties&genericattributeprofile.GattCharacteristicPropertiesRead == 0 {
 		return 0, errNoRead
 	}
@@ -480,6 +508,9 @@ func (c DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) err
 // notification with a new value every time the value of the characteristic
 // changes. And you can select the disable/notify/indicate mode as you need.
 func (c DeviceCharacteristic) EnableNotificationsWithMode(mode NotificationMode, callback func(buf []byte)) error {
+	if c.connectionClosed() {
+		return errDeviceDisconnected
+	}
 	configValue := genericattributeprofile.GattClientCharacteristicConfigurationDescriptorValueNone
 	if mode == NotificationModeDisable {
 		// set to none mode, which disables notifications.
