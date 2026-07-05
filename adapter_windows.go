@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/go-ole/go-ole"
@@ -13,6 +14,11 @@ import (
 	"github.com/saltosystems/winrt-go/windows/foundation"
 	"golang.org/x/sys/windows"
 )
+
+// asyncOperationTimeout caps how long any WinRT async operation may take.
+// Generous enough for slow connects and discoveries; without a cap, an
+// operation that never completes parks its caller forever.
+const asyncOperationTimeout = 20 * time.Second
 
 var _ BLEAdapter = (*Adapter)(nil)
 
@@ -60,10 +66,21 @@ func awaitAsyncOperation(asyncOperation *foundation.IAsyncOperation, genericPara
 	})
 	defer handler.Release()
 
-	asyncOperation.SetCompleted(handler)
+	if err := asyncOperation.SetCompleted(handler); err != nil {
+		return fmt.Errorf("async operation: set completed handler: %w", err)
+	}
 
-	// Wait until async operation has stopped, and finish.
-	<-waitChan
+	// Wait until the async operation has finished — but never forever. Some
+	// operations genuinely never complete (the classic case: service
+	// discovery against a device that is not there, since Windows "connects"
+	// lazily in the background), and a caller parked here for good takes the
+	// whole BLE flow of the application with it. A late completion after the
+	// timeout is harmless: WinRT keeps the handler alive until it fires.
+	select {
+	case <-waitChan:
+	case <-time.After(asyncOperationTimeout):
+		return fmt.Errorf("async operation timed out after %s", asyncOperationTimeout)
+	}
 
 	if status != foundation.AsyncStatusCompleted {
 		if err := getAsyncError(asyncOperation); err != nil {
